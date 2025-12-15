@@ -2,7 +2,6 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 import requests
 import os
-import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,9 +10,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
-# -------------------------------------------------
+# -----------------------------
 # INDIA-SPECIFIC CONFIG
-# -------------------------------------------------
+# -----------------------------
 
 INDIA_INTEREST_MAP = {
     "Temples & Shrines": "temples, shrines, religious sites",
@@ -23,7 +22,7 @@ INDIA_INTEREST_MAP = {
     "Museums & Art Galleries": "museums, art galleries, exhibitions"
 }
 
-# Known places that always have free entry
+# Known places with free entry (truth override)
 KNOWN_FREE_PLACES = {
     "Gateway of India",
     "Marine Drive",
@@ -36,95 +35,61 @@ KNOWN_FREE_PLACES = {
     "Haji Ali Dargah"
 }
 
-# Daily budget caps
+# Budget caps (per day)
 BUDGET_CAPS = {
     "Budget Friendly": 2000,
     "Moderate": 5000,
-    "Luxury Experience": 15000
+    "Luxury Experience": 12000
 }
 
 
-# -------------------------------------------------
+# -----------------------------
 # UTILITY FUNCTIONS
-# -------------------------------------------------
+# -----------------------------
 
-def normalize_costs(text):
-    """Force known free places to always show as Free"""
+def normalize_costs(itinerary_text):
+    """
+    Forces known free places to always show as Free
+    """
     for place in KNOWN_FREE_PLACES:
-        text = text.replace(f"{place} – Low-cost", f"{place} – Free")
-        text = text.replace(f"{place} – Moderate", f"{place} – Free")
-        text = text.replace(f"{place} – Premium", f"{place} – Free")
-    return text
+        itinerary_text = itinerary_text.replace(
+            f"{place} – Low-cost",
+            f"{place} – Free"
+        )
+        itinerary_text = itinerary_text.replace(
+            f"{place} – Moderate",
+            f"{place} – Free"
+        )
+    return itinerary_text
 
 
-def extract_range(text, label):
+def enforce_budget_language(itinerary_text, budget):
     """
-    Extracts ₹min–₹max from lines like:
-    'Food per day: ₹300–₹400'
+    Ensures AI does not exceed budget promises
     """
-    match = re.search(
-        rf"{label}.*?₹\s*(\d+)\s*[–-]\s*(\d+)",
-        text,
-        re.IGNORECASE
-    )
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    return 0, 0
-
-
-def get_day_count(trip_duration):
-    return {
-        "1-day": 1,
-        "2–3 days": 3,
-        "Week": 7
-    }.get(trip_duration, 1)
-
-
-def build_trip_budget_card(itinerary_text, days, budget):
-    attractions = extract_range(itinerary_text, "Attractions per day")
-    food = extract_range(itinerary_text, "Food per day")
-    transport = extract_range(itinerary_text, "Transport per day")
-
-    total_min = (attractions[0] + food[0] + transport[0]) * days
-    total_max = (attractions[1] + food[1] + transport[1]) * days
-
     cap = BUDGET_CAPS.get(budget)
 
-    warning = ""
-    if cap and total_max > cap * days:
-        warning = (
-            "\n⚠️ Note: This plan is at the higher end of your selected budget. "
-            "Consider reducing premium activities or dining choices."
-        )
+    if not cap:
+        return itinerary_text
 
-    return f"""
---------------------------------
-TOTAL TRIP BUDGET BREAKDOWN
---------------------------------
-Trip Duration: {days} Days
-Budget Category: {budget}
+    if cap <= 2000:
+        note = "\nNote: This itinerary prioritizes free attractions, street food, and public transport."
+    elif cap <= 5000:
+        note = "\nNote: This itinerary balances popular attractions with comfort."
+    else:
+        note = "\nNote: This itinerary includes premium experiences and flexibility."
 
-Attractions: ₹{attractions[0] * days} – ₹{attractions[1] * days}
-Food: ₹{food[0] * days} – ₹{food[1] * days}
-Local Transport: ₹{transport[0] * days} – ₹{transport[1] * days}
-
---------------------------------
-Estimated Total Trip Cost:
-₹{total_min} – ₹{total_max}
---------------------------------
-{warning}
-"""
+    return itinerary_text + note
 
 
-# -------------------------------------------------
+# -----------------------------
 # API VIEW
-# -------------------------------------------------
+# -----------------------------
 
 @api_view(['POST'])
 def generate_itinerary(request):
     """
-    Generates a budget-aware, India-specific itinerary
-    with a combined trip budget card at the end.
+    Generates a budget-safe, India-specific travel itinerary.
     """
 
     data = request.data
@@ -141,11 +106,13 @@ def generate_itinerary(request):
             status=400
         )
 
-    interest_str = ", ".join(
+    # Convert interests to India-specific text
+    interest_text = [
         INDIA_INTEREST_MAP[i]
         for i in interests
         if i in INDIA_INTEREST_MAP
-    )
+    ]
+    interest_str = ", ".join(interest_text)
 
     location_str = (
         f"User current coordinates: {location}. "
@@ -153,14 +120,14 @@ def generate_itinerary(request):
     )
 
     budget_guidance = {
-        "Budget Friendly": "Keep daily expenses under ₹2,000 using free attractions, street food, and public transport.",
-        "Moderate": "Daily expenses between ₹2,000–₹5,000 with a balance of comfort and value.",
-        "Luxury Experience": "Flexible spending with premium experiences above ₹5,000 per day."
+        "Budget Friendly": "Daily spending should stay under ₹2,000 using free attractions, street food, and public transport.",
+        "Moderate": "Daily spending should be ₹2,000–₹5,000 with a mix of comfort and value.",
+        "Luxury Experience": "Daily spending can exceed ₹5,000 including premium experiences."
     }.get(budget, "")
 
-    # -------------------------------------------------
-    # PROMPT
-    # -------------------------------------------------
+    # -----------------------------
+    # PROMPT (STRICT & SAFE)
+    # -----------------------------
 
     prompt = f"""
 You are an expert Indian travel planning and budgeting assistant.
@@ -173,7 +140,7 @@ Budget Guidance: {budget_guidance}
 User Interests: {interest_str}
 
 STRICT COST RULES (MANDATORY):
-- NEVER give exact monument entry fees.
+- NEVER give exact entry fees for monuments.
 - Use ONLY these cost labels for attractions:
   • Free
   • Low-cost (₹0–₹100)
@@ -189,13 +156,6 @@ For EACH DAY include:
 - Estimated food cost range
 - Estimated local transport cost
 - Estimated total daily spend range
-
-At the END, include:
-
-BUDGET_SUMMARY:
-- Attractions per day: ₹X–₹Y
-- Food per day: ₹X–₹Y
-- Transport per day: ₹X–₹Y
 
 Respond ONLY in plain text using:
 Day 1:
@@ -215,8 +175,9 @@ etc.
                 "role": "system",
                 "content": (
                     "You are an Indian travel budgeting expert. "
-                    "Never invent exact entry fees. "
-                    "Use ranges and cost categories only."
+                    "You must prioritize factual accuracy. "
+                    "Never invent exact monument entry fees. "
+                    "Use cost ranges and categories only."
                 )
             },
             {
@@ -224,8 +185,8 @@ etc.
                 "content": prompt
             }
         ],
-        "temperature": 0.3,
-        "max_tokens": 1200
+        "max_tokens": 1100,
+        "temperature": 0.3
     }
 
     try:
@@ -240,16 +201,9 @@ etc.
         result = response.json()
         itinerary_text = result["choices"][0]["message"]["content"]
 
+        # Post-processing safety
         itinerary_text = normalize_costs(itinerary_text)
-
-        days = get_day_count(trip_duration)
-        budget_card = build_trip_budget_card(
-            itinerary_text,
-            days,
-            budget
-        )
-
-        itinerary_text += "\n\n" + budget_card
+        itinerary_text = enforce_budget_language(itinerary_text, budget)
 
         return Response({"itinerary": itinerary_text})
 
